@@ -27,13 +27,25 @@ This notebook is structured to demonstrate:
 ---
 """
 
-from google.colab import files
-uploded_files=files.upload()
-
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (classification_report, confusion_matrix, 
+                           roc_auc_score, precision_recall_curve, 
+                           f1_score, roc_curve, auc)
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from scipy.stats import randint, uniform
+import shap
+import joblib
 
-df=pd.read_csv("Churn_Modelling.csv")
+# Read the data
+df = pd.read_csv("Churn_Modelling.csv")
 
 df.info()
 
@@ -87,11 +99,13 @@ import matplotlib.pyplot as plt
 df.boxplot(column="CreditScore", by="Exited", grid=False )
 plt.title("CreditScore vs Exited")
 plt.suptitle("")
+plt.savefig('figures/creditscore_vs_exited.png', bbox_inches='tight')
 plt.show()
 
 df.boxplot(column="Balance", by="Exited", grid=False)
 plt.title("Balance vs Exited")
 plt.suptitle("")
+plt.savefig('figures/balance_vs_exited.png', bbox_inches='tight')
 plt.show()
 
 import seaborn as sns
@@ -102,6 +116,7 @@ corr = df[num_cols].corr()
 plt.figure(figsize=(6,5))
 sns.heatmap(corr, annot=True, fmt=".2f", cmap="viridis")
 plt.title("Correlation Heatmap")
+plt.savefig('figures/correlation_heatmap.png', bbox_inches='tight')
 plt.show()
 
 plt.figure(figsize=(7,4))
@@ -112,6 +127,7 @@ plt.ylabel("Density")
 plt.title("Age Distribution by Churn")
 plt.legend()
 plt.grid(axis="y")
+plt.savefig('figures/age_distribution.png', bbox_inches='tight')
 plt.show()
 
 data0 = df.loc[df["Exited"]==0,"Balance"].values
@@ -121,6 +137,7 @@ plt.boxplot([data0, data1], labels=["Stayed","Churned"], showfliers=False)
 plt.ylabel("Balance")
 plt.title("Balance by Churn (Boxplot)")
 plt.grid(axis="y")
+plt.savefig('figures/balance_boxplot.png', bbox_inches='tight')
 plt.show()
 
 counts = df.groupby(["NumOfProducts","Exited"]).size().unstack(fill_value=0).reindex(sorted(df["NumOfProducts"].unique()))
@@ -136,6 +153,7 @@ plt.ylabel("Count")
 plt.title("NumOfProducts vs Churn (Stacked)")
 plt.legend()
 plt.grid(axis="y")
+plt.savefig('figures/num_products_stacked.png', bbox_inches='tight')
 plt.show()
 
 geo = ["France","Germany","Spain"]
@@ -152,6 +170,7 @@ plt.title("Churn Rate by Geography (Stacked)")
 plt.ylim(0,1)
 plt.legend()
 plt.grid(axis="y")
+plt.savefig('figures/geography_churn_rate.png', bbox_inches='tight')
 plt.show()
 
 """## Train–Test Split and Class Balance
@@ -161,21 +180,22 @@ To evaluate model performance reliably, the dataset is split into **training (80
 Key points:
 - **Target variable**: `Exited` (0 = stayed, 1 = churned).  
 - **Stratification** ensures the same churn ratio is maintained in both train and test sets.  
-- Since churn cases (positive class) are fewer than non-churn, the dataset is **imbalanced**, which requires special handling in modeling (e.g., `scale_pos_weight` in XGBoost).  
+- Since churn cases (positive class) are fewer than non-churned, the dataset is **imbalanced**, which requires special handling in modeling (e.g., `scale_pos_weight` in XGBoost).  
 
 """
 
-X_train, X_test, y_train, y_test, =train_test_split(
+# Prepare the data
+X = df.drop(columns=["RowNumber", "CustomerId", "Surname", "Exited"])
+y = df["Exited"]
 
-  X,y,
-  test_size=0.20,
-  stratify=y,
-  random_state=42
+# Split data into train and test sets
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=42
 )
 
 print("Train class ratio:")
 print((y_train.value_counts(normalize=True)*100).round(2))
-print("\nTest class ratio")
+print("\nTest class ratio:")
 print((y_test.value_counts(normalize=True)*100).round(2))
 
 """## Modeling with XGBoost Pipeline
@@ -193,13 +213,69 @@ Key design choices:
   - The `scale_pos_weight` parameter is set based on the ratio of non-churned to churned customers  
 
 This integrated pipeline makes the model cleaner, repeatable, and production-ready.
-
 """
 
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression
+# Model Pipeline and Hyperparameter Optimization
+print("\nPreparing the model pipeline...")
+categorical_cols = ["Geography", "Gender"]
+numeric_cols = [col for col in X_train.columns if col not in categorical_cols]
+
+# Preprocessing pipeline
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("cat", OneHotEncoder(drop="first", handle_unknown="ignore"), categorical_cols),
+        ("num", StandardScaler(), numeric_cols),
+    ]
+)
+
+# XGBoost base model pipeline
+base_model = Pipeline([
+    ("preprocessor", preprocessor),
+    ("classifier", XGBClassifier(
+        random_state=42,
+        use_label_encoder=False,
+        eval_metric="logloss",
+        scale_pos_weight=y_train.value_counts()[0] / y_train.value_counts()[1]
+    ))
+])
+
+# Hyperparameter optimization
+print("\nStarting hyperparameter optimization...")
+param_dist = {
+    "classifier__n_estimators": randint(300, 900),
+    "classifier__max_depth": randint(3, 9),
+    "classifier__learning_rate": uniform(0.01, 0.15),
+    "classifier__subsample": uniform(0.6, 0.4),
+    "classifier__colsample_bytree": uniform(0.6, 0.4),
+    "classifier__min_child_weight": randint(1, 8),
+    "classifier__gamma": uniform(0.0, 0.4),
+    "classifier__reg_lambda": uniform(0.5, 1.5),
+    "classifier__reg_alpha": uniform(0.0, 0.5)
+}
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+search = RandomizedSearchCV(
+    estimator=base_model,
+    param_distributions=param_dist,
+    n_iter=30,
+    scoring="roc_auc",
+    n_jobs=-1,
+    cv=cv,
+    verbose=1,
+    random_state=42
+)
+
+# Find the best model
+search.fit(X_train, y_train)
+model = search.best_estimator_
+
+print("\nBest parameters:")
+for param, value in search.best_params_.items():
+    print(f"{param}: {value}")
+
+# Data transformations
+X_train_transformed = model.named_steps["preprocessor"].transform(X_train)
+X_test_transformed = model.named_steps["preprocessor"].transform(X_test)
 
 """## Model Evaluation
 
@@ -215,18 +291,20 @@ These metrics provide a holistic view of how well the model balances accuracy an
 
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 
-y_pred= clf.predict(X_test)
-y_proba=clf.predict_proba(X_test)[:,1]
+# Tahminler yapılıyor
+print("\nMaking predictions...")
+y_pred = model.predict(X_test)
+y_probs = model.predict_proba(X_test)[:,1]
 
-
-print("ROC-AUC:", roc_auc_score(y_test, y_proba))
-print("\nClassification Report:\n", classification_report(y_test, y_pred, digits=3))
-print("\Confusion Matrix:\n", confusion_matrix(y_test, y_pred ))
-
-y_probs=clf.predict_proba(X_test)[:,1]
-
-y_pred_05=(y_probs>=0.5).astype(int)
+print("\nModel Evaluation Results:")
+print("-----------------------------")
 print("ROC-AUC:", roc_auc_score(y_test, y_probs))
+print("\nClassification Report:\n", classification_report(y_test, y_pred, digits=3))
+print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
+
+# Farklı eşik değerleriyle sonuçları değerlendir
+# Eşik = 0.5
+y_pred_05 = (y_probs >= 0.5).astype(int)
 print("\nClassification Report (threshold=0.5):")
 print(classification_report(y_test, y_pred_05))
 print("\nConfusion Matrix (threshold=0.5):")
@@ -250,29 +328,77 @@ print(confusion_matrix(y_test, y_pred_06))
 
 from sklearn.ensemble import RandomForestClassifier
 
-rf=Pipeline(steps=[
+# Model Karşılaştırması
+print("\nComparing models...")
+
+# Random Forest model
+rf_model = Pipeline(steps=[
     ("preprocessor", preprocessor),
     ("classifier", RandomForestClassifier(
         n_estimators=200,
-        max_depth= None,
+        max_depth=None,
         random_state=42,
         class_weight="balanced"
     ))
 ])
 
-rf.fit(X_train, y_train)
-y_pred=rf.predict(X_test)
-y_probs=rf.predict_proba(X_test)[:,1]
+# Random Forest eğitimi ve tahminler
+rf_model.fit(X_train, y_train)
+rf_pred = rf_model.predict(X_test)
+rf_probs = rf_model.predict_proba(X_test)[:,1]
 
-print("ROC-AUC:",roc_auc_score(y_test, y_probs))
-print("\nClassification Report:\n", classification_report(y_test, y_pred))
-print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
+# XGBoost tahminleri
+xgb_pred = model.predict(X_test)
+xgb_probs = model.predict_proba(X_test)[:,1]
+
+# Model karşılaştırma sonuçları
+results = pd.DataFrame({
+    'Model': ['XGBoost', 'Random Forest'],
+    'ROC-AUC': [roc_auc_score(y_test, xgb_probs), 
+                roc_auc_score(y_test, rf_probs)],
+    'Accuracy': [(xgb_pred == y_test).mean(), 
+                (rf_pred == y_test).mean()],
+    'F1-Score': [f1_score(y_test, xgb_pred), 
+                 f1_score(y_test, rf_pred)]
+})
+
+print("\nModel Comparison Results:")
+print(results.round(4))
+
+# En iyi modelin detaylı sonuçları
+print("\nBest Model (XGBoost) Detailed Results:")
+print("\nClassification Report:")
+print(classification_report(y_test, xgb_pred))
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_test, xgb_pred))
 
 import numpy as np
 pos=(y_train==1).sum()
 neg=(y_train==0).sum()
 scale_pos_weight=neg/pos
 scale_pos_weight
+
+# Preprocessing definition
+categorical_cols = ["Geography", "Gender"]
+numeric_cols = [col for col in X_train.columns if col not in categorical_cols]
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("cat", OneHotEncoder(drop="first", handle_unknown="ignore"), categorical_cols),
+        ("num", StandardScaler(), numeric_cols),
+    ]
+)
+
+# Model pipeline definition
+pipe = Pipeline([
+    ("preprocessor", preprocessor),
+    ("classifier", XGBClassifier(
+        random_state=42,
+        use_label_encoder=False,
+        eval_metric="logloss",
+        scale_pos_weight=y_train.value_counts()[0] / y_train.value_counts()[1]
+    ))
+])
 
 from xgboost import XGBClassifier
 from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
@@ -318,26 +444,7 @@ print("Test ROC-AUC:", roc_auc_score(y_test, y_probs))
 print("\nClassification Report:\n", classification_report(y_test, y_pred))
 print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
 
-X = df.drop("Exited", axis=1)
-y = df["Exited"]
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
-
-X = df.drop(columns=["RowNumber", "CustomerId", "Surname", "Exited"])
-y = df["Exited"]
-
-
-from sklearn.model_selection import train_test_split
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
-
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from xgboost import XGBClassifier
+# This part was already done above
 
 
 categorical_cols = ["Geography", "Gender"]
@@ -365,15 +472,18 @@ xgb_model = Pipeline(
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 
 
+# XGBoost modelini eğit ve tahminleri al
+print("Training XGBoost model...")
 xgb_model.fit(X_train, y_train)
-
-
 y_pred = xgb_model.predict(X_test)
 y_probs = xgb_model.predict_proba(X_test)[:, 1]
+print("XGBoost model training and predictions completed.\n")
 
-print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+print("Model Evaluation Results:")
+print("-----------------------------")
+print("ROC-AUC:", roc_auc_score(y_test, y_probs))
 print("\nClassification Report:\n", classification_report(y_test, y_pred))
-print("\nROC-AUC:", roc_auc_score(y_test, y_probs))
+print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
 
 """## Threshold Optimization
 
@@ -404,6 +514,7 @@ plt.ylabel("Score")
 plt.title("Precision-Recall vs Threshold")
 plt.legend()
 plt.grid()
+plt.savefig('figures/precision_recall_threshold.png', bbox_inches='tight')
 plt.show()
 
 
@@ -426,7 +537,7 @@ for t in thresholds:
 best_idx = np.argmax(f1_scores)
 best_threshold = thresholds[best_idx]
 
-print("Best threshold (F1'e göre):", best_threshold)
+print("Best threshold (based on F1):", best_threshold)
 
 
 y_pred_best = (y_probs >= best_threshold).astype(int)
@@ -453,17 +564,42 @@ These insights guide actionable policies (e.g., product bundling for low-product
 import shap
 
 
-explainer = shap.Explainer(xgb_model.named_steps["classifier"],
-                           xgb_model.named_steps["preprocessor"].transform(X_train))
-
-X_test_transformed = xgb_model.named_steps["preprocessor"].transform(X_test)
+# SHAP Değerleri ve Özellik Önem Analizi
+print("\nCalculating SHAP values...")
+feature_names = model.named_steps["preprocessor"].get_feature_names_out()
+explainer = shap.Explainer(model.named_steps["classifier"])
 shap_values = explainer(X_test_transformed)
 
+# SHAP visualizations
+print("Creating SHAP visualizations...")
+plt.figure(figsize=(10,6))
+shap.summary_plot(shap_values, X_test_transformed, plot_type="bar", feature_names=feature_names)
+plt.savefig('figures/shap_importance_bar.png', bbox_inches='tight')
+plt.close()
 
-shap.summary_plot(shap_values, X_test_transformed, plot_type="bar", feature_names=xgb_model.named_steps["preprocessor"].get_feature_names_out())
+plt.figure(figsize=(10,8))
+shap.summary_plot(shap_values, X_test_transformed, feature_names=feature_names)
+plt.savefig('figures/shap_importance_dot.png', bbox_inches='tight')
+plt.close()
 
+# Get feature names after preprocessor is fitted
+feature_names = preprocessor.get_feature_names_out()
+shap_importance = np.abs(shap_values.values).mean(axis=0)
 
-shap.summary_plot(shap_values, X_test_transformed, feature_names=xgb_model.named_steps["preprocessor"].get_feature_names_out())
+importance_df = pd.DataFrame({
+    "Feature": feature_names,
+    "Mean(|SHAP|)": shap_importance
+}).sort_values(by="Mean(|SHAP|)", ascending=False)
+
+importance_df.head(15)
+
+plt.figure(figsize=(8,6))
+plt.barh(importance_df["Feature"][:15][::-1], importance_df["Mean(|SHAP|)"][:15][::-1])
+plt.xlabel("Mean(|SHAP value|)")
+plt.title("Feature Importance (based on SHAP values)")
+plt.grid(axis="x")
+plt.savefig('figures/feature_importance.png', bbox_inches='tight')
+plt.show()
 
 """## ROC Curve
 
@@ -492,6 +628,7 @@ plt.ylabel("True Positive Rate")
 plt.title("Receiver Operating Characteristic (ROC Curve)")
 plt.legend(loc="lower right")
 plt.grid()
+plt.savefig('figures/roc_curve.png', bbox_inches='tight')
 plt.show()
 
 """## Feature Importance (Table)
@@ -523,6 +660,7 @@ plt.barh(importance_df["Feature"][:15][::-1], importance_df["Mean(|SHAP|)"][:15]
 plt.xlabel("Mean(|SHAP value|)")
 plt.title("Feature Importance (based on SHAP values)")
 plt.grid(axis="x")
+plt.savefig('figures/feature_importance.png', bbox_inches='tight')
 plt.show()
 
 """## Model Saving & Reusability
@@ -534,12 +672,61 @@ This enables direct `predict` on new data without retraining, ensuring consisten
 
 import joblib
 
-joblib.dump(xgb_model, "churn_model.pkl")
+# En iyi modeli kaydet (Hyperparameter optimization sonrası)
+print("\nSaving the best model...")
+joblib.dump(model, "churn_model.pkl")
+print("Model successfully saved: churn_model.pkl")
 
-print("Model saved as churn_model.pkl")
-
+# Test için modeli yükle ve tahmin yap
+print("\nTesting the model...")
 loaded_model = joblib.load("churn_model.pkl")
-
-
 sample_pred = loaded_model.predict(X_test[:5])
-print(sample_pred)
+print("Sample predictions:", sample_pred)
+
+def plot_model_performance(y_true, y_prob, thresholds, save_path=None):
+    """Visualizes model performance metrics."""
+    # Precision-Recall vs Threshold
+    precisions, recalls, _ = precision_recall_curve(y_true, y_prob)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(thresholds, precisions[:-1], 'b-', label='Precision')
+    plt.plot(thresholds, recalls[:-1], 'r-', label='Recall')
+    plt.xlabel('Threshold')
+    plt.ylabel('Score')
+    plt.title('Precision-Recall vs Threshold')
+    plt.legend()
+    plt.grid(True)
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
+
+def plot_roc_curve(y_true, y_prob, save_path=None):
+    """Plots the ROC curve."""
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    roc_auc = auc(fpr, tpr)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, 'b-', label=f'ROC curve (AUC = {roc_auc:.3f})')
+    plt.plot([0, 1], [0, 1], 'r--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC)')
+    plt.legend(loc="lower right")
+    plt.grid(True)
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
+
+def plot_feature_importance(importance_df, n_features=15, save_path=None):
+    """Plots the feature importance graph."""
+    plt.figure(figsize=(10, 8))
+    plt.barh(importance_df['Feature'][:n_features][::-1], 
+            importance_df['Mean(|SHAP|)'][:n_features][::-1])
+    plt.xlabel('Mean(|SHAP value|)')
+    plt.title('Feature Importance')
+    plt.grid(axis='x')
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
